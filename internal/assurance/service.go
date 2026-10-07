@@ -105,6 +105,22 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if err := m.PutCase(item); err != nil {
 			return err
 		}
+		opening, err := domain.NewOpeningRevision(
+			m.NextID("revision"),
+			item.ID,
+			item.Version,
+			item.DeviceID,
+			item.Nominal,
+			item.Tolerance,
+			item.Steward,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendRevision(opening); err != nil {
+			return err
+		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
@@ -149,6 +165,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
+			item.Version,
 			input.Observed,
 			item.Nominal,
 			item.Tolerance,
@@ -232,6 +249,88 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 	return result, err
 }
 
+func (s *Service) ReviseCase(ctx context.Context, caseID string, input contracts.ReviseCaseRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		basis := strings.TrimSpace(input.Basis)
+		deviceID := strings.TrimSpace(input.DeviceID)
+		if actor == "" || reason == "" || basis == "" || deviceID == "" {
+			return fmt.Errorf("%w: device id, actor, reason, and basis are required", domain.ErrInvalidInput)
+		}
+		if input.ExpectedVersion < 1 {
+			return fmt.Errorf("%w: expected version must be positive", domain.ErrInvalidInput)
+		}
+
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		target, exists := m.Device(deviceID)
+		if !exists {
+			return fmt.Errorf("%w: device %s", domain.ErrNotFound, deviceID)
+		}
+		if !target.IsActive() {
+			return fmt.Errorf("%w: device %s is %s", domain.ErrStateConflict, target.ID, target.Status)
+		}
+		if active, exists := m.ActiveCaseForDeviceExcept(target.ID, item.ID); exists {
+			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
+		}
+
+		previous := item
+		hasMeasurements := len(m.Measurements(item.ID)) > 0
+		if err := item.Revise(target.ID, input.Nominal, input.Tolerance, input.ExpectedVersion, hasMeasurements, s.now()); err != nil {
+			return err
+		}
+		revision, err := domain.NewCaseRevision(
+			m.NextID("revision"),
+			item.ID,
+			item.Version,
+			item.DeviceID,
+			item.Nominal,
+			item.Tolerance,
+			actor,
+			reason,
+			basis,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendRevision(revision); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		detail := fmt.Sprintf(
+			"scope revised from device %s nominal %g tolerance %g (v%d) to device %s nominal %g tolerance %g (v%d); reason: %s; basis: %s",
+			previous.DeviceID, previous.Nominal, previous.Tolerance, previous.Version,
+			item.DeviceID, item.Nominal, item.Tolerance, item.Version,
+			reason, basis,
+		)
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"case_revised",
+			actor,
+			detail,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		result = caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
 func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -243,9 +342,9 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
-		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
+		measurement, ok := bestAcceptedMeasurementForVersion(m.Measurements(item.ID), item.Version)
 		if !ok {
-			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
+			return fmt.Errorf("%w: an accepted measurement for the current case version is required before sealing", domain.ErrStateConflict)
 		}
 		if err := item.Seal(s.now()); err != nil {
 			return err
@@ -288,11 +387,17 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
-func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
+// bestAcceptedMeasurementForVersion picks the accepted measurement with the
+// smallest absolute deviation. A version of 0 matches any version; otherwise
+// only measurements recorded against the current case version are eligible.
+func bestAcceptedMeasurementForVersion(items []domain.Measurement, version int) (domain.Measurement, bool) {
 	var selected domain.Measurement
 	found := false
 	for _, item := range items {
 		if !item.Accepted {
+			continue
+		}
+		if version > 0 && item.CaseVersion != version {
 			continue
 		}
 		if !found || item.AbsoluteDeviation() < selected.AbsoluteDeviation() {
@@ -306,6 +411,7 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
+		Revisions:    m.Revisions(item.ID),
 		Measurements: m.Measurements(item.ID),
 		Events:       m.Events(item.ID),
 	}
@@ -318,6 +424,7 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
+		Revisions:    snapshot.Revisions(item.ID),
 		Measurements: snapshot.Measurements(item.ID),
 		Events:       snapshot.Events(item.ID),
 	}

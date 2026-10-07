@@ -26,6 +26,16 @@ type ReopenCaseRequest struct {
 	Reason string `json:"reason"`
 }
 
+type ReviseCaseRequest struct {
+	DeviceID        string  `json:"device_id"`
+	Nominal         float64 `json:"nominal"`
+	Tolerance       float64 `json:"tolerance"`
+	Actor           string  `json:"actor"`
+	Reason          string  `json:"reason"`
+	Basis           string  `json:"basis"`
+	ExpectedVersion int     `json:"expected_version"`
+}
+
 type SealCaseRequest struct {
 	Reviewer string `json:"reviewer"`
 	Summary  string `json:"summary"`
@@ -37,6 +47,7 @@ type DeviceResponse struct {
 
 type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
+	Revisions    []domain.CaseRevision   `json:"revisions"`
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`

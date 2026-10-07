@@ -12,6 +12,7 @@ type Repository struct {
 	mu           sync.RWMutex
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.CaseRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -22,6 +23,7 @@ func New() *Repository {
 	return &Repository{
 		devices:      make(map[string]domain.Device),
 		cases:        make(map[string]domain.VerificationCase),
+		revisions:    make(map[string][]domain.CaseRevision),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
@@ -31,6 +33,7 @@ func New() *Repository {
 type Snapshot struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.CaseRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -53,6 +56,10 @@ func (s Snapshot) DeviceByTag(tag string) (domain.Device, bool) {
 func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
 	item, ok := s.cases[id]
 	return item, ok
+}
+
+func (s Snapshot) Revisions(caseID string) []domain.CaseRevision {
+	return append([]domain.CaseRevision(nil), s.revisions[caseID]...)
 }
 
 func (s Snapshot) Measurements(caseID string) []domain.Measurement {
@@ -93,6 +100,7 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.CaseRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -156,12 +164,33 @@ func (m *Mutation) UpdateCase(item domain.VerificationCase) error {
 }
 
 func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase, bool) {
+	return m.ActiveCaseForDeviceExcept(deviceID, "")
+}
+
+func (m *Mutation) ActiveCaseForDeviceExcept(deviceID, exceptCaseID string) (domain.VerificationCase, bool) {
 	for _, item := range m.cases {
-		if item.DeviceID == deviceID && item.IsUnfinished() {
+		if item.DeviceID == deviceID && item.IsUnfinished() && item.ID != exceptCaseID {
 			return item, true
 		}
 	}
 	return domain.VerificationCase{}, false
+}
+
+func (m *Mutation) AppendRevision(item domain.CaseRevision) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	for _, existing := range m.revisions[item.CaseID] {
+		if existing.Version == item.Version {
+			return fmt.Errorf("%w: revision for version %d already exists", domain.ErrStateConflict, item.Version)
+		}
+	}
+	m.revisions[item.CaseID] = append(m.revisions[item.CaseID], item)
+	return nil
+}
+
+func (m *Mutation) Revisions(caseID string) []domain.CaseRevision {
+	return append([]domain.CaseRevision(nil), m.revisions[caseID]...)
 }
 
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
@@ -222,6 +251,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	next := &Mutation{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		revisions:    cloneRevisions(r.revisions),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -232,6 +262,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	}
 	r.devices = next.devices
 	r.cases = next.cases
+	r.revisions = next.revisions
 	r.measurements = next.measurements
 	r.seals = next.seals
 	r.events = next.events
@@ -243,6 +274,7 @@ func (r *Repository) snapshot() Snapshot {
 	return Snapshot{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		revisions:    cloneRevisions(r.revisions),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -269,6 +301,14 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 	result := make(map[string][]domain.Measurement, len(values))
 	for key, value := range values {
 		result[key] = append([]domain.Measurement(nil), value...)
+	}
+	return result
+}
+
+func cloneRevisions(values map[string][]domain.CaseRevision) map[string][]domain.CaseRevision {
+	result := make(map[string][]domain.CaseRevision, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.CaseRevision(nil), value...)
 	}
 	return result
 }

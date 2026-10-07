@@ -39,6 +39,7 @@ func main() {
 		"open-verification-case":   checkOpenVerificationCase,
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
+		"revise-case-scope":        checkReviseCaseScope,
 		"seal-verification":        checkSealVerification,
 	}
 	run, ok := checks[*workflow]
@@ -304,6 +305,385 @@ func checkReopenVerificationCase() error {
 	return nil
 }
 
+func checkReviseCaseScope() error {
+	h := newHarness()
+	defer h.close()
+
+	// Fresh case: the steward corrects nominal value and tolerance before any
+	// measurement has been recorded.
+	deviceID, err := h.createDevice("MET-1351")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	version, err := nestedInt(opened.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if version != 1 {
+		return fmt.Errorf("opened case version = %d, expected 1", version)
+	}
+
+	revised, err := h.reviseScope(caseID, map[string]any{
+		"device_id":        deviceID,
+		"nominal":          26.0,
+		"tolerance":        0.2,
+		"actor":            "Lin",
+		"reason":           "nameplate nominal confirmed at the bench",
+		"basis":            "calibration certificate CAL-2026-031",
+		"expected_version": 1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(revised, http.StatusOK); err != nil {
+		return err
+	}
+	newVersion, err := nestedInt(revised.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if newVersion != 2 {
+		return fmt.Errorf("revised case version = %d, expected 2", newVersion)
+	}
+	nominal, err := nestedFloat(revised.Body, "case", "nominal")
+	if err != nil {
+		return err
+	}
+	if nominal != 26.0 {
+		return fmt.Errorf("revised nominal = %v, expected 26", nominal)
+	}
+	tolerance, err := nestedFloat(revised.Body, "case", "tolerance")
+	if err != nil {
+		return err
+	}
+	if tolerance != 0.2 {
+		return fmt.Errorf("revised tolerance = %v, expected 0.2", tolerance)
+	}
+	state, err := nestedString(revised.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("revised case state = %q", state)
+	}
+
+	// Both versions remain traceable in the same case history.
+	revisions, err := nestedSlice(revised.Body, "revisions")
+	if err != nil {
+		return err
+	}
+	if len(revisions) != 2 {
+		return fmt.Errorf("revision history = %d entries, expected 2", len(revisions))
+	}
+	first := revisions[0].(map[string]any)
+	if first["kind"] != "opened" || int(first["version"].(float64)) != 1 {
+		return fmt.Errorf("first revision entry is not the v1 opening record: %v", first)
+	}
+	if first["nominal"].(float64) != 25.0 || first["tolerance"].(float64) != 0.5 {
+		return fmt.Errorf("v1 scope was not preserved: %v", first)
+	}
+	second := revisions[1].(map[string]any)
+	if second["kind"] != "revised" || int(second["version"].(float64)) != 2 {
+		return fmt.Errorf("second revision entry is not the v2 revision record: %v", second)
+	}
+	if second["reason"] != "nameplate nominal confirmed at the bench" ||
+		second["basis"] != "calibration certificate CAL-2026-031" {
+		return fmt.Errorf("v2 reason and basis were not recorded: %v", second)
+	}
+
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "case_revised") {
+		return errors.New("revision audit event is missing")
+	}
+
+	// Revising against a stale version (the case is already at v2) must be a
+	// conflict with a definite version result.
+	stale, err := h.reviseScope(caseID, map[string]any{
+		"device_id":        deviceID,
+		"nominal":          27.0,
+		"tolerance":        0.3,
+		"actor":            "Lin",
+		"reason":           "late correction",
+		"basis":            "stale read of the case",
+		"expected_version": 1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stale, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(stale, "version_conflict"); err != nil {
+		return err
+	}
+
+	// Measurements after revision use the current version and scope: 25.2 was
+	// inside the old range but is out of tolerance against nominal 26 +/- 0.2.
+	recorded, err := h.recordMeasurement(caseID, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recorded, http.StatusCreated); err != nil {
+		return err
+	}
+	measurementVersion, err := nestedInt(recorded.Body, "measurements", 0, "case_version")
+	if err != nil {
+		return err
+	}
+	if measurementVersion != 2 {
+		return fmt.Errorf("measurement bound to version %d, expected 2", measurementVersion)
+	}
+	measurementNominal, err := nestedFloat(recorded.Body, "measurements", 0, "nominal")
+	if err != nil {
+		return err
+	}
+	if measurementNominal != 26.0 {
+		return fmt.Errorf("measurement nominal = %v, expected 26", measurementNominal)
+	}
+	recordedState, err := nestedString(recorded.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if recordedState != "recheck_required" {
+		return fmt.Errorf("post-revision measurement state = %q, expected recheck_required", recordedState)
+	}
+
+	// A case that already has measurements cannot be revised, even when the
+	// caller presents the current version.
+	afterMeasurement, err := h.reviseScope(caseID, map[string]any{
+		"device_id":        deviceID,
+		"nominal":          27.0,
+		"tolerance":        0.3,
+		"actor":            "Lin",
+		"reason":           "attempt after measurement",
+		"basis":            "should be rejected",
+		"expected_version": 2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(afterMeasurement, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(afterMeasurement, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Concurrent revisions against the same version produce exactly one
+	// success and one version conflict.
+	concurrentDeviceID, err := h.createDevice("MET-1352")
+	if err != nil {
+		return err
+	}
+	concurrentOpened, err := h.openCase(concurrentDeviceID)
+	if err != nil {
+		return err
+	}
+	concurrentCaseID, err := nestedString(concurrentOpened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.reviseScope(concurrentCaseID, map[string]any{
+				"device_id":        concurrentDeviceID,
+				"nominal":          26.0 + float64(index),
+				"tolerance":        0.2,
+				"actor":            "Lin",
+				"reason":           fmt.Sprintf("concurrent correction %d", index+1),
+				"basis":            "field confirmation form F-09",
+				"expected_version": 1,
+			})
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusOK:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+			if err := expectErrorCode(item.response, "version_conflict"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpected concurrent revision status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent revision outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	// Revising a sealed case is rejected.
+	sealedCaseID, err := h.readyCase("MET-1353")
+	if err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+sealedCaseID+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "accepted measurement sealed",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealedTargetID, err := h.createDevice("MET-1354")
+	if err != nil {
+		return err
+	}
+	reviseSealed, err := h.reviseScope(sealedCaseID, map[string]any{
+		"device_id":        sealedTargetID,
+		"nominal":          30.0,
+		"tolerance":        1.0,
+		"actor":            "Lin",
+		"reason":           "attempt after seal",
+		"basis":            "should be rejected",
+		"expected_version": 2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reviseSealed, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(reviseSealed, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Moving the case to another active device keeps the same case id and
+	// history, and frees the original device for a new case.
+	movedDeviceID, err := h.createDevice("MET-1355")
+	if err != nil {
+		return err
+	}
+	movedOpened, err := h.openCase(movedDeviceID)
+	if err != nil {
+		return err
+	}
+	movedCaseID, err := nestedString(movedOpened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	targetDeviceID, err := h.createDevice("MET-1356")
+	if err != nil {
+		return err
+	}
+	moved, err := h.reviseScope(movedCaseID, map[string]any{
+		"device_id":        targetDeviceID,
+		"nominal":          25.0,
+		"tolerance":        0.5,
+		"actor":            "Lin",
+		"reason":           "case reassigned to the confirmed asset",
+		"basis":            "asset tag correction memo",
+		"expected_version": 1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(moved, http.StatusOK); err != nil {
+		return err
+	}
+	movedTo, err := nestedString(moved.Body, "case", "device_id")
+	if err != nil {
+		return err
+	}
+	if movedTo != targetDeviceID {
+		return fmt.Errorf("case device = %q, expected %q", movedTo, targetDeviceID)
+	}
+	reopenedOnOriginal, err := h.openCase(movedDeviceID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopenedOnOriginal, http.StatusCreated); err != nil {
+		return err
+	}
+
+	// A target device that already has an unfinished case is a definite
+	// conflict.
+	busyDeviceID, err := h.createDevice("MET-1357")
+	if err != nil {
+		return err
+	}
+	busyOpened, err := h.openCase(busyDeviceID)
+	if err != nil {
+		return err
+	}
+	busyCaseID, err := nestedString(busyOpened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	busyTargetID, err := h.createDevice("MET-1358")
+	if err != nil {
+		return err
+	}
+	if _, err := h.openCase(busyTargetID); err != nil {
+		return err
+	}
+	busy, err := h.reviseScope(busyCaseID, map[string]any{
+		"device_id":        busyTargetID,
+		"nominal":          25.0,
+		"tolerance":        0.5,
+		"actor":            "Lin",
+		"reason":           "move onto a busy device",
+		"basis":            "should be rejected",
+		"expected_version": 1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(busy, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(busy, "active_case_exists"); err != nil {
+		return err
+	}
+
+	// Missing reason, basis, or expected version is a 400.
+	missingFields, err := h.reviseScope(busyCaseID, map[string]any{
+		"device_id":        busyDeviceID,
+		"nominal":          25.0,
+		"tolerance":        0.5,
+		"actor":            "Lin",
+		"expected_version": 1,
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(missingFields, http.StatusBadRequest)
+}
+
 func checkSealVerification() error {
 	h := newHarness()
 	defer h.close()
@@ -463,6 +843,10 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func (h *harness) reviseScope(caseID string, body map[string]any) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/revisions", body)
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
@@ -549,6 +933,30 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedNumber(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
+}
+
+func nestedInt(root map[string]any, path ...any) (int, error) {
+	number, err := nestedNumber(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	return int(number), nil
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	return nestedNumber(root, path...)
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {

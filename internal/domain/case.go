@@ -17,12 +17,15 @@ const (
 )
 
 type VerificationCase struct {
-	ID        string     `json:"id"`
-	DeviceID  string     `json:"device_id"`
-	Nominal   float64    `json:"nominal"`
-	Tolerance float64    `json:"tolerance"`
-	Steward   string     `json:"steward"`
-	State     CaseState  `json:"state"`
+	ID        string    `json:"id"`
+	DeviceID  string    `json:"device_id"`
+	Nominal   float64   `json:"nominal"`
+	Tolerance float64   `json:"tolerance"`
+	Steward   string    `json:"steward"`
+	State     CaseState `json:"state"`
+	// Version is the effective scope version: 1 when the case opens and
+	// incremented only by a committed scope revision. State transitions such
+	// as measurement, reopen, and seal do not change it.
 	Version   int        `json:"version"`
 	OpenedAt  time.Time  `json:"opened_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
@@ -78,7 +81,6 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error 
 	} else {
 		c.State = CaseRecheckRequired
 	}
-	c.Version++
 	c.UpdatedAt = at.UTC()
 	return nil
 }
@@ -88,6 +90,44 @@ func (c *VerificationCase) Reopen(at time.Time) error {
 		return fmt.Errorf("%w: only a recheck_required case can be reopened", ErrStateConflict)
 	}
 	c.State = CaseAwaitingMeasurement
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
+// Revise applies a field-confirmed scope correction. It is only legal while
+// the case is still awaiting its first measurement (hasMeasurements reports
+// whether any measurement exists for the case); expectedVersion is the
+// optimistic-concurrency guard so simultaneous revisions cannot both commit.
+// A revision must change at least one scope field.
+func (c *VerificationCase) Revise(deviceID string, nominal, tolerance float64, expectedVersion int, hasMeasurements bool, at time.Time) error {
+	if c.State == CaseSealed {
+		return fmt.Errorf("%w: a sealed case cannot be revised", ErrStateConflict)
+	}
+	if c.State != CaseAwaitingMeasurement {
+		return fmt.Errorf("%w: a case with recorded measurements cannot be revised", ErrStateConflict)
+	}
+	if hasMeasurements {
+		return fmt.Errorf("%w: a case with recorded measurements cannot be revised", ErrStateConflict)
+	}
+	if expectedVersion < 1 {
+		return fmt.Errorf("%w: expected version must be positive", ErrInvalidInput)
+	}
+	if c.Version != expectedVersion {
+		return fmt.Errorf("%w: case is at version %d, not %d", ErrVersionConflict, c.Version, expectedVersion)
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return fmt.Errorf("%w: revised device id is required", ErrInvalidInput)
+	}
+	if !isFinite(nominal) || !isFinite(tolerance) || tolerance <= 0 {
+		return fmt.Errorf("%w: nominal must be finite and tolerance must be positive", ErrInvalidInput)
+	}
+	if deviceID == c.DeviceID && nominal == c.Nominal && tolerance == c.Tolerance {
+		return fmt.Errorf("%w: revision must change the device, nominal value, or tolerance", ErrInvalidInput)
+	}
+	c.DeviceID = deviceID
+	c.Nominal = nominal
+	c.Tolerance = tolerance
 	c.Version++
 	c.UpdatedAt = at.UTC()
 	return nil
@@ -99,7 +139,6 @@ func (c *VerificationCase) Seal(at time.Time) error {
 	}
 	stamp := at.UTC()
 	c.State = CaseSealed
-	c.Version++
 	c.UpdatedAt = stamp
 	c.SealedAt = &stamp
 	return nil

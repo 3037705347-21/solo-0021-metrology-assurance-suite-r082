@@ -21,6 +21,7 @@ go run ./cmd/workflowcheck --workflow register-device
 go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
+go run ./cmd/workflowcheck --workflow revise-case-scope
 go run ./cmd/workflowcheck --workflow seal-verification
 ```
 
@@ -40,6 +41,7 @@ or extend these smoke checks with red/green verification tests.
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/revisions`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
 
@@ -53,6 +55,19 @@ or extend these smoke checks with red/green verification tests.
 - `internal/repository`: copy-on-write in-memory persistence.
 - `internal/contracts`: API request and response models.
 - `internal/bootstrap`: concrete dependency wiring.
+
+## Scope Revisions
+
+Between case opening and the first measurement, the steward can correct the
+associated device, nominal value, or tolerance with a reason and a supporting
+basis via `POST /cases/{id}/revisions`. A revision produces a new effective
+version of the same case instead of cancelling and reopening it; all prior
+versions remain visible in the case's `revisions` history. The request carries
+`expected_version` for optimistic concurrency control, so simultaneous
+revisions resolve to exactly one success and one `version_conflict`.
+Measurements are bound to the current version, and sealing selects an accepted
+measurement recorded against the current version. Revisions are rejected for
+sealed cases and cases that already have measurements.
 
 ## Inputs And Outputs
 
