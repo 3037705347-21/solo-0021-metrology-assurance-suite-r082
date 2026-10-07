@@ -12,6 +12,7 @@ type Repository struct {
 	mu           sync.RWMutex
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.ScopeRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -22,6 +23,7 @@ func New() *Repository {
 	return &Repository{
 		devices:      make(map[string]domain.Device),
 		cases:        make(map[string]domain.VerificationCase),
+		revisions:    make(map[string][]domain.ScopeRevision),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
@@ -31,6 +33,7 @@ func New() *Repository {
 type Snapshot struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.ScopeRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -53,6 +56,10 @@ func (s Snapshot) DeviceByTag(tag string) (domain.Device, bool) {
 func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
 	item, ok := s.cases[id]
 	return item, ok
+}
+
+func (s Snapshot) Revisions(caseID string) []domain.ScopeRevision {
+	return append([]domain.ScopeRevision(nil), s.revisions[caseID]...)
 }
 
 func (s Snapshot) Measurements(caseID string) []domain.Measurement {
@@ -93,6 +100,7 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	revisions    map[string][]domain.ScopeRevision
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -164,6 +172,39 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+// ActiveCaseForDeviceOther reports whether another unfinished case is bound to
+// the device, so a revision that moves a case to a different device keeps the
+// "one unfinished case per device" invariant.
+func (m *Mutation) ActiveCaseForDeviceOther(deviceID, excludeCaseID string) (domain.VerificationCase, bool) {
+	for _, item := range m.cases {
+		if item.ID == excludeCaseID || !item.IsUnfinished() {
+			continue
+		}
+		if item.DeviceID == deviceID {
+			return item, true
+		}
+	}
+	return domain.VerificationCase{}, false
+}
+
+func (m *Mutation) AppendRevision(item domain.ScopeRevision) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	history := m.revisions[item.CaseID]
+	for _, existing := range history {
+		if existing.Version == item.Version {
+			return fmt.Errorf("%w: revision version %d already exists for case %s", domain.ErrStateConflict, item.Version, item.CaseID)
+		}
+	}
+	m.revisions[item.CaseID] = append(history, item)
+	return nil
+}
+
+func (m *Mutation) Revisions(caseID string) []domain.ScopeRevision {
+	return append([]domain.ScopeRevision(nil), m.revisions[caseID]...)
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
@@ -222,6 +263,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	next := &Mutation{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		revisions:    cloneRevisions(r.revisions),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -232,6 +274,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	}
 	r.devices = next.devices
 	r.cases = next.cases
+	r.revisions = next.revisions
 	r.measurements = next.measurements
 	r.seals = next.seals
 	r.events = next.events
@@ -243,6 +286,7 @@ func (r *Repository) snapshot() Snapshot {
 	return Snapshot{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		revisions:    cloneRevisions(r.revisions),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -261,6 +305,14 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 	result := make(map[string]domain.VerificationCase, len(values))
 	for key, value := range values {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneRevisions(values map[string][]domain.ScopeRevision) map[string][]domain.ScopeRevision {
+	result := make(map[string][]domain.ScopeRevision, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.ScopeRevision(nil), value...)
 	}
 	return result
 }

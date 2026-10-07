@@ -26,6 +26,22 @@ type ReopenCaseRequest struct {
 	Reason string `json:"reason"`
 }
 
+// ReviseCaseScopeRequest opens a new effective scope version for the same
+// case. ExpectedVersion is the version the steward reviewed; a stale value is
+// a deterministic conflict so concurrent revisions cannot silently overwrite
+// each other. DeviceID is optional: when blank the case stays on its device;
+// when present the case is rebound to that device and keeps the device's
+// at-most-one-unfinished-case rule.
+type ReviseCaseScopeRequest struct {
+	ExpectedVersion int     `json:"expected_version"`
+	DeviceID        string  `json:"device_id,omitempty"`
+	Nominal         float64 `json:"nominal"`
+	Tolerance       float64 `json:"tolerance"`
+	Actor           string  `json:"actor"`
+	Reason          string  `json:"reason"`
+	Basis           string  `json:"basis"`
+}
+
 type SealCaseRequest struct {
 	Reviewer string `json:"reviewer"`
 	Summary  string `json:"summary"`
@@ -37,6 +53,7 @@ type DeviceResponse struct {
 
 type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
+	Revisions    []domain.ScopeRevision  `json:"revisions"`
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`

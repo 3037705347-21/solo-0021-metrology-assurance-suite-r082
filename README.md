@@ -21,6 +21,7 @@ go run ./cmd/workflowcheck --workflow register-device
 go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
+go run ./cmd/workflowcheck --workflow revise-case-scope
 go run ./cmd/workflowcheck --workflow seal-verification
 ```
 
@@ -40,8 +41,23 @@ or extend these smoke checks with red/green verification tests.
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/revisions`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+
+## Scope Revisions
+
+After a case is opened but before any measurement is recorded, the
+responsible steward can correct the nominal value, tolerance, or associated
+device without cancelling the case. `POST /cases/{id}/revisions` takes the
+`expected_version` the steward reviewed, the corrected fields, and the
+`reason` and `basis` for the correction. It appends a new effective version
+to the same case; older versions remain visible in `revisions`. Measurements
+and the seal are stamped with the version they used, and only the current
+version can be measured and sealed. Concurrent revisions resolve to exactly
+one success; stale `expected_version` values, existing measurements, sealed
+cases, non-owner actors, and invalid targets each receive a deterministic
+error.
 
 ## Layout
 

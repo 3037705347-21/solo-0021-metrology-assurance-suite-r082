@@ -69,6 +69,9 @@ func (c VerificationCase) IsUnfinished() bool {
 	return c.State != CaseSealed
 }
 
+// RecordMeasurement moves the case through its measurement lifecycle. The
+// scope Version is intentionally left untouched: it identifies the effective
+// nominal/tolerance/device revision, not every state transition.
 func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error {
 	if c.State != CaseAwaitingMeasurement {
 		return fmt.Errorf("%w: case is not awaiting measurement", ErrStateConflict)
@@ -78,7 +81,6 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error 
 	} else {
 		c.State = CaseRecheckRequired
 	}
-	c.Version++
 	c.UpdatedAt = at.UTC()
 	return nil
 }
@@ -88,6 +90,28 @@ func (c *VerificationCase) Reopen(at time.Time) error {
 		return fmt.Errorf("%w: only a recheck_required case can be reopened", ErrStateConflict)
 	}
 	c.State = CaseAwaitingMeasurement
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
+// ReviseScope starts a new effective scope version after on-site confirmation.
+// It is only valid while the case is awaiting its first measurement on the
+// current scope: an existing measurement or a sealed case must be rejected by
+// the caller, which owns the cross-entity checks. Tolerance is validated here
+// so a malformed revision can never become the current version.
+func (c *VerificationCase) ReviseScope(deviceID string, nominal, tolerance float64, at time.Time) error {
+	if c.State != CaseAwaitingMeasurement {
+		return fmt.Errorf("%w: only an awaiting_measurement case can revise its scope", ErrStateConflict)
+	}
+	if strings.TrimSpace(deviceID) == "" {
+		return fmt.Errorf("%w: revision device id is required", ErrInvalidInput)
+	}
+	if !isFinite(nominal) || !isFinite(tolerance) || tolerance <= 0 {
+		return fmt.Errorf("%w: nominal must be finite and tolerance must be positive", ErrInvalidInput)
+	}
+	c.DeviceID = strings.TrimSpace(deviceID)
+	c.Nominal = nominal
+	c.Tolerance = tolerance
 	c.Version++
 	c.UpdatedAt = at.UTC()
 	return nil
@@ -99,7 +123,6 @@ func (c *VerificationCase) Seal(at time.Time) error {
 	}
 	stamp := at.UTC()
 	c.State = CaseSealed
-	c.Version++
 	c.UpdatedAt = stamp
 	c.SealedAt = &stamp
 	return nil
